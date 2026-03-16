@@ -1,0 +1,15 @@
+{
+  "data_path": "./data/IDRiD/A. Segmentation",
+  "num_classes": 1,
+  "device": "cuda",
+  "batch_size": 3,
+  "epochs": 500,
+  "lr": 0.0001,
+  "optimizer": "adam",
+  "lesion_type": "SE",
+  "PVB_LIST": ["OUT_3", "OUT_2"],
+  "CVB_LIST": ["OUT_3", "OUT_2"],
+
+  "pfm_k": 17,
+  "rsm_k": 35
+}
