@@ -24,6 +24,8 @@ class SegmentationPresetTrain:
             trans.append(T.RandomVerticalFlip(vflip_prob))
         trans.extend([
             T.Normalize(mean=mean, std=std),
+            T.RandomAffine(degrees=15, translate=(0.1, 0.1), shear=10),
+            # T.MaskedHistogramEqualization()
         ])
         self.transforms = T.Compose(trans)
 
@@ -34,6 +36,7 @@ class SegmentationPresetTrain:
 class SegmentationPresetEval:
     def __init__(self, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         self.transforms = T.Compose([
+            # T.MaskedHistogramEqualization(),
             T.Normalize(mean=mean, std=std),
         ])
 
@@ -140,6 +143,7 @@ def main(args):
 
     # 将原本的 best_dice 替换为 best_aucpr
     best_aucpr = 0.
+    best_dice = 0.
     start_time = time.time()
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -155,7 +159,7 @@ def main(args):
         print(val_info)
         print(f"dice coefficient: {dice:.4f}")
         print(f"AUCPR: {aucpr:.4f}")  # 打印 AUCPR
-
+        best_dice = max(best_dice, dice)
         # 【修改 2】：将 AUCPR 写入 results 文本日志
         with open(results_file, "a") as f:
             train_info = f"[epoch: {epoch}]\n" \
@@ -189,7 +193,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print("training time {}".format(total_time_str))
-
+    print("Best AUPR {}".format(best_aucpr))
+    print("Best Dice {}".format(best_dice))
 
 def parse_args(config_file="config.json"):
     # 增加 RPN 特有参数

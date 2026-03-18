@@ -1,11 +1,148 @@
 import numpy as np
 import random
-
+import PIL.Image as Image
 import torch
 from torchvision import transforms as T
 from torchvision.transforms import functional as F
+import random
+import torchvision.transforms.functional as TF
 
 
+class MaskedHistogramEqualization(object):
+    """
+    带掩码的直方图均衡化 (预处理)
+    已强化：完美兼容输入为 PyTorch Tensor ([C, H, W]) 或 PIL Image ([H, W, C])。
+    """
+
+    def __call__(self, image, target):
+        is_tensor = isinstance(image, torch.Tensor)
+
+        # --- 1. 统一转换为 NumPy 格式 ---
+        if is_tensor:
+            img_np = image.cpu().numpy()
+            target_np = target.cpu().numpy()
+
+            # 如果图像已经 ToTensor 转成了 [0.0, 1.0] 的浮点数，需要先转回 0-255 的 uint8
+            is_float = img_np.dtype.kind == 'f'
+            if is_float:
+                img_np = (img_np * 255).astype(np.uint8)
+        else:
+            img_np = np.array(image)
+            target_np = np.array(target)
+            is_float = False
+
+        # --- 2. 提取有效区域掩码并统一通道维度 ---
+        if is_tensor:
+            # Tensor 维度是 (C, H, W)
+            C = img_np.shape[0]
+            # 兼容 target 是 (1, H, W) 或 (H, W) 的情况
+            valid_mask = target_np[0] != 255 if target_np.ndim == 3 else target_np != 255
+        else:
+            # PIL 转换为 NumPy 后维度是 (H, W, C)
+            C = img_np.shape[2] if img_np.ndim == 3 else 1
+            # 兼容 target 是 (H, W, 1) 或 (H, W) 的情况
+            valid_mask = target_np[:, :, 0] != 255 if target_np.ndim == 3 else target_np != 255
+
+        # 如果全图都是忽略区(防崩溃保护)，直接返回原图
+        if not valid_mask.any():
+            return image, target
+
+        equalized_img_np = np.empty_like(img_np)
+
+        # --- 3. 遍历每个颜色通道进行带掩码均衡化 ---
+        for c in range(C):
+            # 取出当前通道 (H, W)
+            if is_tensor:
+                channel = img_np[c, :, :]
+            else:
+                channel = img_np[:, :, c] if img_np.ndim == 3 else img_np
+
+            valid_pixels = channel[valid_mask]
+
+            # 计算有效区域内的直方图
+            hist, bins = np.histogram(valid_pixels, bins=256, range=[0, 256])
+            cdf = hist.cumsum()
+
+            # 归一化累积分布函数 (CDF)
+            cdf_masked = np.ma.masked_equal(cdf, 0)
+            cdf_masked = (cdf_masked - cdf_masked.min()) * 255 / (cdf_masked.max() - cdf_masked.min())
+            cdf = np.ma.filled(cdf_masked, 0).astype('uint8')
+
+            # 像素替换
+            equalized_channel = channel.copy()
+            equalized_channel[valid_mask] = cdf[valid_pixels]
+
+            # 写回结果数组
+            if is_tensor:
+                equalized_img_np[c, :, :] = equalized_channel
+            else:
+                if img_np.ndim == 3:
+                    equalized_img_np[:, :, c] = equalized_channel
+                else:
+                    equalized_img_np = equalized_channel
+
+        # --- 4. 转换回原始传入的数据格式 ---
+        if is_tensor:
+            if is_float:
+                equalized_img_np = equalized_img_np.astype(np.float32) / 255.0
+            return torch.from_numpy(equalized_img_np).to(image.device), target
+        else:
+            return Image.fromarray(equalized_img_np), target
+
+
+class RandomAffine(object):
+    """
+    随机仿射变换 (数据增强)
+    一次性实现论文要求的：随机旋转 (Rotation)、平移 (Translation) 和剪切 (Shear)。
+    """
+
+    def __init__(self, degrees=15, translate=(0.1, 0.1), shear=10):
+        self.degrees = degrees
+        self.translate = translate
+        self.shear = shear
+
+    def __call__(self, image, target):
+        if random.random() > 0.5:
+            # 1. 随机生成变换参数
+            angle = random.uniform(-self.degrees, self.degrees)
+
+            # 兼容获取图像宽高
+            if isinstance(image, torch.Tensor):
+                img_w, img_h = image.shape[-1], image.shape[-2]
+            else:
+                img_w, img_h = image.size[0], image.size[1]
+
+            # 平移量计算
+            max_dx = self.translate[0] * img_w
+            max_dy = self.translate[1] * img_h
+            tx = random.uniform(-max_dx, max_dx)
+            ty = random.uniform(-max_dy, max_dy)
+
+            # 剪切角度
+            shear_angle = random.uniform(-self.shear, self.shear)
+
+            # 2. 对原图进行仿射变换
+            image = TF.affine(
+                image,
+                angle=angle,
+                translate=[tx, ty],  # 注意：新版 PyTorch 推荐用 list [tx, ty] 而不是 tuple
+                scale=1.0,
+                shear=[shear_angle],  # shear 也可以传入 list
+                interpolation=TF.InterpolationMode.BILINEAR
+            )
+
+            # 3. 对 Mask 进行严格相同的仿射变换
+            target = TF.affine(
+                target,
+                angle=angle,
+                translate=[tx, ty],
+                scale=1.0,
+                shear=[shear_angle],
+                interpolation=TF.InterpolationMode.NEAREST,
+                fill=255
+            )
+
+        return image, target
 def pad_if_smaller(img, size, fill=0):
     # 如果图像最小边长小于给定size，则用数值fill进行padding
     min_size = min(img.size)

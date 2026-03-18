@@ -11,21 +11,18 @@ class TargetGenerator:
     def __init__(self, rsm_strides=None, rsm_k=35, pfm_k=128):
         self.rsm_strides = rsm_strides
         self.pfm_k = pfm_k
-        self.rsm_k = rsm_k
+        self.rsm_k_u = rsm_k
 
     def generate_rsm_batch(self, mask_tensor):
         """
         批量生成多尺度 RSM (使用 核心确信+周边晕染 的高级融合策略)
         """
         rsms = []
-
+        rsm_k = self.rsm_k_u  # 每次调用时重置 rsm_k，确保多尺度生成时正确递减
         for s in self.rsm_strides:
-            current_k = int(self.rsm_k) if int(self.rsm_k) % 2 == 1 else int(self.rsm_k) - 1
+            current_k = int(rsm_k) if int(rsm_k) % 2 == 1 else int(rsm_k) - 1
             current_k = max(3, current_k)
 
-            # ==========================================================
-            # 1. Halo (光晕层)：严格执行论文公式，计算区域病灶密度 (均值池化)
-            # ==========================================================
             halo = F.avg_pool2d(
                 mask_tensor,
                 kernel_size=current_k,
@@ -34,34 +31,16 @@ class TargetGenerator:
                 count_include_pad=True
             )
 
-            # ==========================================================
-            # 2. Core (核心层)：提取当前尺度下绝对的病灶位置 (最大池化)
-            # 步长为 s，确保下采样后病灶的中心位置与特征图严格对齐，且值为 1.0
-            # ==========================================================
-            if s > 1:
-                core = F.max_pool2d(mask_tensor, kernel_size=s, stride=s)
-            else:
-                core = mask_tensor
-
-            # --- 尺寸对齐保护 (处理奇偶除法误差) ---
             expected_h = mask_tensor.shape[2] // s
             expected_w = mask_tensor.shape[3] // s
 
             if halo.shape[2:] != (expected_h, expected_w):
                 halo = halo[:, :, :expected_h, :expected_w]
-            if core.shape[2:] != (expected_h, expected_w):
-                core = core[:, :, :expected_h, :expected_w]
 
-            # ==========================================================
-            # 3. Fusion (融合)：你的天才想法！取两者的最大值
-            # 效果：病灶处必然是 1.0，周围则是逐渐衰减的均值概率
-            # ==========================================================
-            rsm = halo
-
-            rsms.append(rsm)
+            rsms.append(halo)
 
             # 随尺度加深减小区域范围
-            self.rsm_k //= 2
+            rsm_k //= 2
 
         return rsms
     def generate_pfm_batch(self, mask_tensor):

@@ -19,6 +19,10 @@ def criterion(pred_rsms, pred_pfm, gt_rsms, gt_pfm, ignore_mask):
     loss = 0.0
 
     # --- 1. 计算 PVB 损失 (多尺度 RSM 监督) ---
+    neg_weight_val = 1.0  # 纯背景的基础权重
+    min_pos_weight = 2.0  # 只要有病灶，最低保底权重 (防止 MA 小病灶被忽略)
+    density_scale = 1.0  # 密度带来的额外权重加成 (密度为1时，最高权重为 5 + 5 = 10)
+
     for pred_rsm, gt_rsm in zip(pred_rsms, gt_rsms):
         # 统一 ignore_mask 的尺寸
         if pred_rsm.shape[2:] != ignore_mask.shape[2:]:
@@ -30,9 +34,29 @@ def criterion(pred_rsms, pred_pfm, gt_rsms, gt_pfm, ignore_mask):
         valid_rsm = ~curr_ignore
 
         if valid_rsm.sum() > 0:
+            pred_valid = pred_rsm[valid_rsm]
+            gt_valid = gt_rsm.float()[valid_rsm]
+
+            # ==========================================
+            # 高阶修改：基于密度的动态权重 (Density-Aware Weighting)
+            # ==========================================
+            # 1. 初始化全为背景权重 (1.0)
+            weight_tensor = torch.full_like(gt_valid, neg_weight_val)
+
+            # 2. 找到所有包含病灶的区域 (GT > 0)
+            pos_mask = gt_valid > 0
+
+            if pos_mask.sum() > 0:
+                # 3. 核心公式：保底权重 + 密度 * 缩放系数
+                # 假设 gt_valid=0.01 (小病灶): weight = 5.0 + 0.01*5.0 = 5.05 (靠保底存活)
+                # 假设 gt_valid=1.00 (大病灶): weight = 5.0 + 1.00*5.0 = 10.0 (获得满额重视)
+                weight_tensor[pos_mask] = min_pos_weight + gt_valid[pos_mask] * density_scale
+
+            # 将构建好的动态权重张量传入 weight 参数
             loss += F.binary_cross_entropy(
-                pred_rsm[valid_rsm],
-                gt_rsm.float()[valid_rsm]
+                pred_valid,
+                gt_valid,
+                weight=weight_tensor
             )
 
     # --- 2. 计算 CVB 损失 (全尺寸 PFM 监督) ---
@@ -69,10 +93,28 @@ def evaluate(model, data_loader, device, num_classes):
             if target_long.dim() == 4:
                 target_long = target_long.squeeze(1)
 
-            _, pred_pfm = model(image)
+            # 获取 PVB 和 CVB 的预测
+            pred_rsms, pred_pfm = model(image)
 
-            # 将 logits 转换为 0~1 的概率
-            output_prob = torch.sigmoid(pred_pfm).squeeze(1)
+            # 1. 获取 CVB 的细节预测概率
+            cvb_prob = torch.sigmoid(pred_pfm).squeeze(1)
+
+            # 2. 获取 PVB 的大局区域预测概率
+            rsm_prob = pred_rsms[0].squeeze(1)
+            if rsm_prob.shape != cvb_prob.shape:
+                rsm_prob = F.interpolate(rsm_prob.unsqueeze(1), size=cvb_prob.shape[-2:], mode='bilinear',
+                                         align_corners=True).squeeze(1)
+
+            # ==========================================
+            # 核心修复：使用“掩码乘法”代替“概率直乘” (相当于连续域的逻辑与)
+            # ==========================================
+            # 因为 PVB 偏灰白（宁滥勿缺），我们给它一个较低的宽容阈值（比如 0.1 或 0.15）
+            # 这代表只要 PVB 觉得这块区域"哪怕有一点点嫌疑"，我们就允许 CVB 去发挥
+            rsm_mask = (rsm_prob > 0.15).float()
+
+            # 逻辑与：掩码外直接归零（抑制背景），掩码内 100% 保留 CVB 原本的自信度（不发生衰减）
+            output_prob = cvb_prob * rsm_mask
+            # ==========================================
 
             # 过滤掉标签为 255 的眼球外死黑区域
             valid_mask = target_long != 255
